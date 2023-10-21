@@ -30,7 +30,7 @@ func (u *UDPRX) ReceivedDataCallback(rxCallback func([]byte)) {
 	u.rxCallback = rxCallback
 }
 
-func (u *UDPRX) Receive() {
+func (u *UDPRX) StartReceiving() {
 	go func() {
 		for {
 			buf := make([]byte, 1024)

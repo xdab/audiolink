@@ -21,16 +21,17 @@ func CreateUDPTX(remoteHost string, remotePort int) *UDPTX {
 
 func (u *UDPTX) Open() error {
 	var err error
-	log.Default().Println("Opening UDP TX socket on port", u.remoteAddr.Port)
+	log.Println("Opening UDP TX socket on port", u.remoteAddr.Port)
 	u.socket, err = net.DialUDP("udp", nil, u.remoteAddr)
 	return err
 }
 
 func (u *UDPTX) Send(data []byte) (int, error) {
+	log.Println("Sending", len(data), "bytes")
 	return u.socket.Write(data)
 }
 
 func (u *UDPTX) Close() error {
-	log.Default().Println("Closing UDP TX socket on port", u.remoteAddr.Port)
+	log.Println("Closing UDP TX socket on port", u.remoteAddr.Port)
 	return u.socket.Close()
 }

@@ -6,71 +6,64 @@ import (
 	"log"
 	"os"
 	"sync"
-	"time"
 
 	"github.com/akosmarton/papipes"
 )
 
-const audioSampleRate = 8000
-const audioSampleBytes = 2
-const pulseAudioBufferLength = 100 * time.Millisecond
-const audioFrameLength = 20 * time.Millisecond
-const audioFrameSize = int((audioSampleRate * audioSampleBytes * audioFrameLength) / time.Second)
-const audioRxSeqBufLength = 10
-const maxPlayBufferSize = audioFrameSize*5 + int((audioSampleRate*audioSampleBytes*audioRxSeqBufLength)/time.Second)
+const SAMPLE_FORMAT = "s16le"
+const SAMPLE_BYTES = 2
 
 type VirtualSoundcard struct {
-	devName string
+	Microphone chan []byte
+	Speaker    chan []byte
 
-	deinitNeededChan   chan bool
-	deinitFinishedChan chan bool
+	deviceName string
+	sampleRate int
+	frameSize  int
+	bufferSize int
 
-	// Send to this channel to play audio.
-	play chan []byte
+	stopSignal chan bool
+	stopped    chan bool
 
-	// Read from this channel for audio.
-	rec chan []byte
-
-	virtualSoundcardStream struct {
-		source papipes.Source
-		sink   papipes.Sink
-
-		mutex   sync.Mutex
-		playBuf *bytes.Buffer
-		canPlay chan bool
-	}
+	virtualMicrophone papipes.Source
+	virtualSpeaker    papipes.Sink
+	mutex             sync.Mutex
+	playBuffer        *bytes.Buffer
+	playBufferMaxSize int
+	canPlay           chan bool
 }
 
-func (a *VirtualSoundcard) playLoopToVirtualSoundcard(deinitNeededChan, deinitFinishedChan chan bool) {
+func (a *VirtualSoundcard) virtualMicrophoneFeeder(stopSignal, stopped chan bool) {
 	for {
 		select {
-		case <-a.virtualSoundcardStream.canPlay:
-		case <-deinitNeededChan:
-			deinitFinishedChan <- true
+		case <-a.canPlay:
+		case <-stopSignal:
+			stopped <- true
 			return
 		}
 
 		for {
-			a.virtualSoundcardStream.mutex.Lock()
-			if a.virtualSoundcardStream.playBuf.Len() < audioFrameSize {
-				a.virtualSoundcardStream.mutex.Unlock()
+			a.mutex.Lock()
+			if a.playBuffer.Len() < a.frameSize {
+				a.mutex.Unlock()
 				break
 			}
 
-			d := make([]byte, audioFrameSize)
-			bytesToWrite, err := a.virtualSoundcardStream.playBuf.Read(d)
-			a.virtualSoundcardStream.mutex.Unlock()
+			d := make([]byte, a.frameSize)
+			bytesToWrite, err := a.playBuffer.Read(d)
+
+			a.mutex.Unlock()
 			if err != nil {
 				log.Println(err)
 				break
 			}
 			if bytesToWrite != len(d) {
-				log.Println("buffer underread")
+				log.Println("Buffer underread")
 				break
 			}
 
 			for len(d) > 0 {
-				written, err := a.virtualSoundcardStream.source.Write(d)
+				written, err := a.virtualMicrophone.Write(d)
 				if err != nil {
 					if _, ok := err.(*os.PathError); !ok {
 						log.Println(err)
@@ -83,27 +76,27 @@ func (a *VirtualSoundcard) playLoopToVirtualSoundcard(deinitNeededChan, deinitFi
 	}
 }
 
-func (a *VirtualSoundcard) recLoopFromVirtualSoundcard(deinitNeededChan, deinitFinishedChan chan bool) {
+func (a *VirtualSoundcard) virtualSpeakerConsumer(stopSignal, stopped chan bool) {
 	defer func() {
-		deinitFinishedChan <- true
+		stopped <- true
 	}()
 
-	frameBuf := make([]byte, audioFrameSize)
+	frameBuf := make([]byte, a.frameSize)
 	buf := bytes.NewBuffer([]byte{})
 
 	for {
 		select {
-		case <-deinitNeededChan:
+		case <-stopSignal:
 			return
 		default:
 		}
 
-		n, err := a.virtualSoundcardStream.sink.Read(frameBuf)
+		n, err := a.virtualSpeaker.Read(frameBuf)
 		if err != nil {
 			if _, ok := err.(*os.PathError); !ok {
 				log.Println(err)
 				if err == io.EOF {
-					<-deinitNeededChan
+					<-stopSignal
 					return
 				}
 			}
@@ -112,7 +105,6 @@ func (a *VirtualSoundcard) recLoopFromVirtualSoundcard(deinitNeededChan, deinitF
 		buf.Write(frameBuf[:n])
 
 		for buf.Len() >= len(frameBuf) {
-			// We need to create a new []byte slice for each chunk to be able to send it through the rec chan.
 			b := make([]byte, len(frameBuf))
 			n, err = buf.Read(b)
 			if err != nil {
@@ -123,8 +115,8 @@ func (a *VirtualSoundcard) recLoopFromVirtualSoundcard(deinitNeededChan, deinitF
 			}
 
 			select {
-			case a.rec <- b:
-			case <-deinitNeededChan:
+			case a.Speaker <- b:
+			case <-stopSignal:
 				return
 			}
 		}
@@ -132,129 +124,131 @@ func (a *VirtualSoundcard) recLoopFromVirtualSoundcard(deinitNeededChan, deinitF
 }
 
 func (a *VirtualSoundcard) loop() {
-	playLoopToVirtualSoundcardDeinitNeededChan := make(chan bool)
-	playLoopToVirtualSoundcardDeinitFinishedChan := make(chan bool)
-	go a.playLoopToVirtualSoundcard(playLoopToVirtualSoundcardDeinitNeededChan, playLoopToVirtualSoundcardDeinitFinishedChan)
+	virtualMicrophoneFeederStop := make(chan bool)
+	virtualMicrophoneFeederStopped := make(chan bool)
+	go a.virtualMicrophoneFeeder(virtualMicrophoneFeederStop, virtualMicrophoneFeederStopped)
 
-	recLoopFromVirtualSoundcardDeinitNeededChan := make(chan bool)
-	recLoopFromVirtualSoundcardDeinitFinishedChan := make(chan bool)
-	go a.recLoopFromVirtualSoundcard(recLoopFromVirtualSoundcardDeinitNeededChan, recLoopFromVirtualSoundcardDeinitFinishedChan)
+	virtualSpeakerConsumerStop := make(chan bool)
+	virtualSpeakerConsumerStopped := make(chan bool)
+	go a.virtualSpeakerConsumer(virtualSpeakerConsumerStop, virtualSpeakerConsumerStopped)
 
 	var d []byte
 	for {
 		select {
-		case d = <-a.play:
-		case <-a.deinitNeededChan:
-			a.closeIfNeeded()
+		case d = <-a.Microphone:
+		case <-a.stopSignal:
+			a.close()
 
-			recLoopFromVirtualSoundcardDeinitNeededChan <- true
-			<-recLoopFromVirtualSoundcardDeinitFinishedChan
-			playLoopToVirtualSoundcardDeinitNeededChan <- true
-			<-playLoopToVirtualSoundcardDeinitFinishedChan
+			virtualSpeakerConsumerStop <- true
+			<-virtualSpeakerConsumerStopped
 
-			a.deinitFinishedChan <- true
+			virtualMicrophoneFeederStop <- true
+			<-virtualMicrophoneFeederStopped
+
+			a.stopped <- true
 			return
 		}
 
-		a.virtualSoundcardStream.mutex.Lock()
-		free := maxPlayBufferSize - a.virtualSoundcardStream.playBuf.Len()
+		a.mutex.Lock()
+		free := a.playBufferMaxSize - a.playBuffer.Len()
 		if free < len(d) {
 			b := make([]byte, len(d)-free)
-			_, _ = a.virtualSoundcardStream.playBuf.Read(b)
+			_, _ = a.playBuffer.Read(b)
 		}
-		a.virtualSoundcardStream.playBuf.Write(d)
-		a.virtualSoundcardStream.mutex.Unlock()
+		a.playBuffer.Write(d)
+		a.mutex.Unlock()
 
-		// Non-blocking notify.
 		select {
-		case a.virtualSoundcardStream.canPlay <- true:
+		case a.canPlay <- true:
 		default:
 		}
 	}
 }
 
-// We only init the audio once, with the first device name we acquire, so apps using the virtual sound card
-// won't have issues with the interface going down while the app is running.
-func (a *VirtualSoundcard) Init(devName string) error {
-	a.devName = devName
-	bufferSizeInBits := (audioSampleRate * audioSampleBytes * 8) / 1000 * pulseAudioBufferLength.Milliseconds()
+func (a *VirtualSoundcard) Init(devName string, audioSampleRate int, audioFrameSize int) error {
+	a.deviceName = devName
 
-	if !a.virtualSoundcardStream.source.IsOpen() {
-		a.virtualSoundcardStream.source.Name = a.devName
-		a.virtualSoundcardStream.source.Filename = "/tmp/audiolink-" + a.devName + ".source"
-		a.virtualSoundcardStream.source.Rate = audioSampleRate
-		a.virtualSoundcardStream.source.Format = "s16le"
-		a.virtualSoundcardStream.source.Channels = 1
-		a.virtualSoundcardStream.source.SetProperty("device.buffering.buffer_size", bufferSizeInBits)
-		a.virtualSoundcardStream.source.SetProperty("device.description", "audiolink: "+a.devName)
+	a.sampleRate = audioSampleRate
+	a.frameSize = audioFrameSize
+	a.playBufferMaxSize = 10 * a.frameSize
+	a.bufferSize = a.playBufferMaxSize * SAMPLE_BYTES
+
+	if !a.virtualMicrophone.IsOpen() {
+		a.virtualMicrophone.Name = a.deviceName
+		a.virtualMicrophone.Filename = "/tmp/audiolink-" + a.deviceName + ".source"
+		a.virtualMicrophone.Rate = audioSampleRate
+		a.virtualMicrophone.Format = SAMPLE_FORMAT
+		a.virtualMicrophone.Channels = 1
+		a.virtualMicrophone.SetProperty("device.buffering.buffer_size", a.bufferSize)
+		a.virtualMicrophone.SetProperty("device.description", "audiolink: "+a.deviceName)
 
 		// Cleanup previous pipes.
 		sources, err := papipes.GetActiveSources()
 		if err == nil {
 			for _, i := range sources {
-				if i.Filename == a.virtualSoundcardStream.source.Filename {
+				if i.Filename == a.virtualMicrophone.Filename {
 					i.Close()
 				}
 			}
 		}
 
-		if err := a.virtualSoundcardStream.source.Open(); err != nil {
+		if err := a.virtualMicrophone.Open(); err != nil {
 			return err
 		}
 	}
 
-	if !a.virtualSoundcardStream.sink.IsOpen() {
-		a.virtualSoundcardStream.sink.Name = a.devName
-		a.virtualSoundcardStream.sink.Filename = "/tmp/audiolink-" + a.devName + ".sink"
-		a.virtualSoundcardStream.sink.Rate = audioSampleRate
-		a.virtualSoundcardStream.sink.Format = "s16le"
-		a.virtualSoundcardStream.sink.Channels = 1
-		a.virtualSoundcardStream.sink.UseSystemClockForTiming = true
-		a.virtualSoundcardStream.sink.SetProperty("device.buffering.buffer_size", bufferSizeInBits)
-		a.virtualSoundcardStream.sink.SetProperty("device.description", "audiolink: "+a.devName)
+	if !a.virtualSpeaker.IsOpen() {
+		a.virtualSpeaker.Name = a.deviceName
+		a.virtualSpeaker.Filename = "/tmp/audiolink-" + a.deviceName + ".sink"
+		a.virtualSpeaker.Rate = audioSampleRate
+		a.virtualSpeaker.Format = SAMPLE_FORMAT
+		a.virtualSpeaker.Channels = 1
+		a.virtualSpeaker.UseSystemClockForTiming = true
+		a.virtualSpeaker.SetProperty("device.buffering.buffer_size", a.bufferSize)
+		a.virtualSpeaker.SetProperty("device.description", "audiolink: "+a.deviceName)
 
 		// Cleanup previous pipes.
 		sinks, err := papipes.GetActiveSinks()
 		if err == nil {
 			for _, i := range sinks {
-				if i.Filename == a.virtualSoundcardStream.sink.Filename {
+				if i.Filename == a.virtualSpeaker.Filename {
 					i.Close()
 				}
 			}
 		}
 
-		if err := a.virtualSoundcardStream.sink.Open(); err != nil {
+		if err := a.virtualSpeaker.Open(); err != nil {
 			return err
 		}
 	}
 
-	if a.virtualSoundcardStream.playBuf == nil {
-		log.Print("Opened device " + a.virtualSoundcardStream.source.Name)
+	if a.playBuffer == nil {
+		log.Print("Opened device " + a.virtualMicrophone.Name)
 
-		a.play = make(chan []byte)
-		a.rec = make(chan []byte)
+		a.Microphone = make(chan []byte)
+		a.Speaker = make(chan []byte)
 
-		a.virtualSoundcardStream.playBuf = bytes.NewBuffer([]byte{})
-		a.virtualSoundcardStream.canPlay = make(chan bool)
+		a.playBuffer = bytes.NewBuffer([]byte{})
+		a.canPlay = make(chan bool)
 
-		a.deinitNeededChan = make(chan bool)
-		a.deinitFinishedChan = make(chan bool)
+		a.stopSignal = make(chan bool)
+		a.stopped = make(chan bool)
 		go a.loop()
 	}
 	return nil
 }
 
-func (a *VirtualSoundcard) closeIfNeeded() {
-	if a.virtualSoundcardStream.source.IsOpen() {
-		if err := a.virtualSoundcardStream.source.Close(); err != nil {
+func (a *VirtualSoundcard) close() {
+	if a.virtualMicrophone.IsOpen() {
+		if err := a.virtualMicrophone.Close(); err != nil {
 			if _, ok := err.(*os.PathError); !ok {
 				log.Println(err)
 			}
 		}
 	}
 
-	if a.virtualSoundcardStream.sink.IsOpen() {
-		if err := a.virtualSoundcardStream.sink.Close(); err != nil {
+	if a.virtualSpeaker.IsOpen() {
+		if err := a.virtualSpeaker.Close(); err != nil {
 			if _, ok := err.(*os.PathError); !ok {
 				log.Println(err)
 			}
@@ -263,10 +257,9 @@ func (a *VirtualSoundcard) closeIfNeeded() {
 }
 
 func (a *VirtualSoundcard) Close() {
-	a.closeIfNeeded()
-
-	if a.deinitNeededChan != nil {
-		a.deinitNeededChan <- true
-		<-a.deinitFinishedChan
+	a.close()
+	if a.stopSignal != nil {
+		a.stopSignal <- true
+		<-a.stopped
 	}
 }
